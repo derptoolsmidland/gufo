@@ -190,6 +190,18 @@
         "text_encoder/model.safetensors.index.json",
         "vae/diffusion_pytorch_model.safetensors"
       ]
+    },
+    "inkling2": {
+      "repo": "unsloth/Inkling-2-Mini-GGUF",
+      "revision": "45fd08764f2b0bf16b03a5483a80e5c7aaec8772",
+      "patterns": [
+        "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+        "mmproj-BF16.gguf"
+      ],
+      "required": [
+        "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+        "mmproj-BF16.gguf"
+      ]
     }
   },
   "models": {
@@ -360,6 +372,15 @@
       "service": "tts",
       "variant": "custom",
       "npu": true
+    },
+    "inkling-2-mini": {
+      "title": "Inkling 2 Mini",
+      "category": "llm",
+      "asset": "inkling2",
+      "target": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+      "projector": "mmproj-BF16.gguf",
+      "mode": "off",
+      "sampling": "provider"
     }
   },
   "rules": [
@@ -670,6 +691,16 @@
       ],
       "owners": [
         "deepseek4"
+      ]
+    },
+    {
+      "id": "private-inkling2",
+      "priority": 20,
+      "paths": [
+        "src/models/inkling2/**"
+      ],
+      "owners": [
+        "inkling-2-mini"
       ]
     }
   ]
