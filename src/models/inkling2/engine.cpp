@@ -155,11 +155,9 @@ struct Engine::Impl {
   // the side stream's cross-queue waits in the replayed graph cost more than
   // the prefetch saves (decode 39.4 -> 46.0 tok/s at C = 1 without it).
   static constexpr int kPrefetchBlocks = 20;
-#if defined(_WIN32)
+  // Diagnostic build: off everywhere, so rocprofv3 can trace a decode step
+  // (it hangs on the prefetch side stream). Not for serving.
   static constexpr bool kDecodePrefetch = false;
-#else
-  static constexpr bool kDecodePrefetch = true;
-#endif
   hipStream_t dps = nullptr;
   hipEvent_t ev_pf = nullptr, ev_pfj = nullptr;
   bool pf_open = false;
