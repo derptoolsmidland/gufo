@@ -91,15 +91,25 @@ public:
           {reinterpret_cast<std::uintptr_t>(v->data()), bytes, dev});
       sum += bytes;
     }
+    // Tensors go to the device through one pinned staging buffer. A hipMemcpy
+    // straight from the file mapping makes the driver hold the mapping's
+    // pageable pages for the copy; when host memory is full the kernel
+    // reclaims those pages again before the copy runs and the upload never
+    // finishes (GPU idle, this thread waiting on the copy's signal).
+    constexpr std::size_t kChunk = std::size_t{64} << 20;
+    void* staging = nullptr;
+    Check(hipHostMalloc(&staging, kChunk), "weight staging buffer");
+    const auto free_staging = [](void* p) { (void)hipHostFree(p); };
+    const std::unique_ptr<void, decltype(free_staging)> staging_owner(
+        staging, free_staging);
     for (const auto& t : reader.GetTensors()) {
       if (t.size_bytes == 0)
         continue;
       void* dev = AllocDevice(t.size_bytes, std::string(t.name).c_str());
-      constexpr std::size_t kChunk = std::size_t{64} << 20;
       for (std::size_t off = 0; off < t.size_bytes; off += kChunk) {
         const std::size_t n = std::min(kChunk, t.size_bytes - off);
-        Check(hipMemcpy(static_cast<char*>(dev) + off,
-                        static_cast<const char*>(t.data) + off, n,
+        std::memcpy(staging, static_cast<const char*>(t.data) + off, n);
+        Check(hipMemcpy(static_cast<char*>(dev) + off, staging, n,
                         hipMemcpyHostToDevice),
               "weight upload");
       }
