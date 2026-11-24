@@ -117,10 +117,14 @@ weights (`dspark_fuse`, `dflare_norm`, padded `markov_w1`, `hidden_out`; now
   gives the survival of each prefix; the width maximises expected tokens per
   measured cycle cost (verifying 2/4/8 rows costs about 26/36/55 ms against
   20 ms for one); greedy and coupled proposals keep separate calibrations.
-  Drafting stops early once a longer width cannot pay. Every eight drafted
-  cycles, a request whose cycles emitted fewer tokens per millisecond than
-  its measured plain steps decodes plainly for a while (8 to 64 steps) before
-  probing again.
+  Drafting stops early once a longer width cannot pay. A width's cost is
+  only measured when a step of that width runs, so an estimate left unmeasured
+  for 256 steps counts for no more than the nearest width measured since,
+  scaled by the starting costs, and the width is tried again (one stalled
+  step used to switch a width off until the server restarted). Every
+  eight drafted cycles, a request whose cycles emitted fewer tokens per
+  millisecond than its measured plain steps decodes plainly for a while (8 to
+  64 steps) before probing again.
 
 ## Serving
 

@@ -56,18 +56,48 @@ private:
 class DsparkCosts {
 public:
   static constexpr int kMaxRows = 8;
-  [[nodiscard]] double Verify(int rows) const { return verify_[rows]; }
+  /// Steps without one of a width after which its estimate is stale.
+  static constexpr int kStale = 256;
+  /// The cost of a step of `rows` rows. Only a step of that width refreshes
+  /// its estimate, and the policy stops choosing a width whose estimate is
+  /// too high (one stalled step, or steps at a longer context, are enough;
+  /// the plain step's too, which leaves every cycle drafting). So a stale
+  /// estimate counts for no more than the nearest width measured since (a
+  /// narrower one if there is one), scaled by the starting costs: the width
+  /// is tried again, and what that step measures replaces the estimate.
+  [[nodiscard]] double Verify(int rows) const {
+    if (age_[rows] < kStale)
+      return verify_[rows];
+    for (int r = rows - 1; r >= 1; --r) {
+      if (age_[r] < kStale)
+        return std::min(verify_[rows], verify_[r] * start_[rows] / start_[r]);
+    }
+    for (int r = rows + 1; r <= kMaxRows; ++r) {
+      if (age_[r] < kStale)
+        return std::min(verify_[rows], verify_[r] * start_[rows] / start_[r]);
+    }
+    return verify_[rows];
+  }
   /// Starting costs of steps whose rows belong to several sessions (their
   /// rows route to more distinct experts than one session's).
   static DsparkCosts Batched() {
     DsparkCosts c;
-    c.verify_ = {0, 21.9, 29.3, 35.5, 42.8, 47.8, 53.0, 58.0, 63.0};
+    c.verify_ = c.start_ = {0,    21.9, 29.3, 35.5, 42.8,
+                            47.8, 53.0, 58.0, 63.0};
     return c;
   }
   [[nodiscard]] double Draft(int tokens) const {
     return draft_base_ + draft_step_ * tokens;
   }
-  void ObserveVerify(int rows, double ms) { Ema(verify_[rows], ms); }
+  void ObserveVerify(int rows, double ms) {
+    if (age_[rows] < kStale)
+      Ema(verify_[rows], ms);
+    else
+      verify_[rows] = ms;
+    for (int& age : age_)
+      age = std::min(age + 1, kStale);
+    age_[rows] = 0;
+  }
   void ObserveDraft(int tokens, double ms) {
     // the per-token part from the known base, the base from the rest
     if (tokens > 0)
@@ -78,8 +108,10 @@ public:
 private:
   static void Ema(double& v, double x) { v += 0.05 * (x - v); }
   // Strix Halo, short context (inkling2_bench --spec / --dspark)
-  std::array<double, kMaxRows + 1> verify_{0,    20.2, 26.2, 31.0, 35.5,
-                                           40.5, 45.3, 50.0, 54.9};
+  std::array<double, kMaxRows + 1> start_{0,    20.2, 26.2, 31.0, 35.5,
+                                          40.5, 45.3, 50.0, 54.9};
+  std::array<double, kMaxRows + 1> verify_ = start_;
+  std::array<int, kMaxRows + 1> age_{};  // steps since one of each width
   double draft_base_ = 2.8, draft_step_ = 0.25;
 };
 
