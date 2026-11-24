@@ -2641,6 +2641,7 @@ void Engine::ProposalLogits(int step, float* out) {
   const std::lock_guard lock(mutex_);
   if (impl_->dsp == nullptr)
     throw std::runtime_error("inkling2: no drafter");
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
   impl_->dsp->ProposalLogits(impl_->ds, step, out);
 }
 
