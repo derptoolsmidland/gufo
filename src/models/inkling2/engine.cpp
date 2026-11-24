@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -193,6 +194,64 @@ struct Engine::Impl {
     pf_open = false;
   }
   hipEvent_t ev_msg[2] = {};
+  // Waiting for a decode or verification step. HIP's stream wait spins a
+  // core for the whole step. On Strix Halo the cores and the GPU share one
+  // package power limit, so on a power-limited host that core takes power
+  // from the GPU (gufo-org/gufo #987). WaitStep can instead sleep until a
+  // host function queued behind the step runs on HIP's callback thread,
+  // which the GPU's completion interrupt wakes (the wait of #962).
+  // Experiment switch, this fork only: GUFO_LAB_INKLING2_WAIT=asleep.
+  struct HostWake {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::uint64_t armed = 0;  // host functions queued (waiting thread only)
+    std::uint64_t done = 0;   // host functions run
+  };
+  bool asleep_wait = false;
+  hipStream_t ns = nullptr;  // runs the host functions beside the work
+  hipEvent_t ev_step = nullptr;
+  HostWake wake;
+  static void NotifyHost(void* data) {
+    auto* host = static_cast<HostWake*>(data);
+    {
+      const std::lock_guard<std::mutex> lock(host->mutex);
+      ++host->done;
+    }
+    host->ready.notify_one();
+  }
+  /// Waits for everything queued on `st`.
+  void WaitStep(hipStream_t st, const char* what) {
+    if (!asleep_wait) {
+      Check(hipStreamSynchronize(st), what);
+      return;
+    }
+    Check(hipEventRecord(ev_step, st), what);
+    hipError_t status = hipEventQuery(ev_step);
+    if (status == hipErrorNotReady) {
+      // Only this thread queues host functions (the engine mutex is held):
+      // a ticket counts the ones actually queued.
+      const std::uint64_t ticket = wake.armed + 1;
+      Check(hipStreamWaitEvent(ns, ev_step, 0), what);
+      Check(hipLaunchHostFunc(ns, NotifyHost, &wake), what);
+      wake.armed = ticket;
+      std::unique_lock<std::mutex> lock(wake.mutex);
+      while (wake.done < ticket) {
+        // A faulted device never runs the host function: look every second.
+        if (wake.ready.wait_for(lock, std::chrono::seconds(1)) ==
+            std::cv_status::timeout) {
+          lock.unlock();
+          status = hipEventQuery(ev_step);
+          if (status != hipErrorNotReady && status != hipSuccess)
+            Check(status, what);
+          lock.lock();
+        }
+      }
+    } else if (status != hipSuccess) {
+      Check(status, what);
+    }
+    // The step is complete; this returns without waiting.
+    Check(hipStreamSynchronize(st), what);
+  }
   // DSpark drafter (Engine::AttachDrafter) and the target features it reads:
   // the inputs of visit slots 5, 29 and 47 and the final normed output, [row]
   // [4][2304] (decode steps: d_feat; prefill ubatches: p_feat).
@@ -520,7 +579,11 @@ struct Engine::Impl {
       (void)hipStreamDestroy(ps);
     if (dps)
       (void)hipStreamDestroy(dps);
-    for (hipEvent_t e : {ev_pf, ev_pfj})
+    if (ns) {
+      (void)hipStreamSynchronize(ns);
+      (void)hipStreamDestroy(ns);
+    }
+    for (hipEvent_t e : {ev_pf, ev_pfj, ev_step})
       if (e)
         (void)hipEventDestroy(e);
     if (h_amax)
@@ -677,6 +740,10 @@ struct Engine::Impl {
     Check(hipEventCreateWithFlags(&ev_pf, hipEventDisableTiming), "event");
     Check(hipEventCreateWithFlags(&ev_pfj, hipEventDisableTiming), "event");
     Check(hipEventCreateWithFlags(&ev_join, hipEventDisableTiming), "event");
+    Check(hipStreamCreateWithFlags(&ns, hipStreamNonBlocking), "notify stream");
+    Check(hipEventCreateWithFlags(&ev_step, hipEventDisableTiming), "event");
+    if (const char* wait = std::getenv("GUFO_LAB_INKLING2_WAIT"))
+      asleep_wait = std::strcmp(wait, "asleep") == 0;
     for (hipEvent_t* e :
          {&ev_bank, &ev_msg[0], &ev_msg[1], &ev_visit[0], &ev_visit[1]})
       Check(hipEventCreateWithFlags(e, hipEventDisableTiming), "event");
@@ -1886,7 +1953,7 @@ struct Engine::Impl {
                    .n = 1};
       dsp->InjectRows(ds, std::span<const Drafter::Rows>(rows, n));
     }
-    Check(hipStreamSynchronize(ds), "decode sync");
+    WaitStep(ds, "decode sync");
     if (step_argmax != nullptr)
       std::memcpy(step_argmax, h_amax, static_cast<std::size_t>(n) * 4);
     for (int b = 0; b < n; ++b)
@@ -1966,7 +2033,7 @@ struct Engine::Impl {
                            hipMemcpyDeviceToHost, ds),
             "argmax copy");
     }
-    Check(hipStreamSynchronize(ds), "verify sync");
+    WaitStep(ds, "verify sync");
     if (argmax != nullptr)
       std::memcpy(argmax, h_amax, static_cast<std::size_t>(n) * 4);
     nb = 1;
