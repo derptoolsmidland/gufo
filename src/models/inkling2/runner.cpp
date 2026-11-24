@@ -57,6 +57,17 @@ namespace g = ::gufo::ext;
 namespace ga = ::inkling2::text::gufo_adapter;
 
 constexpr std::string_view kStateAbi = "inkling2-hip-m2-v1";
+
+// Lab diagnostics, not for upstream: with GUFO_LAB_DSPARK_TRACE=<file>, one
+// line per single-session DSpark cycle (times, widths and the cost table the
+// width policy holds after the cycle). Nothing else changes.
+std::FILE* LabDsparkTrace() {
+  static std::FILE* const file = [] {
+    const char* path = std::getenv("GUFO_LAB_DSPARK_TRACE");
+    return path != nullptr && *path != 0 ? std::fopen(path, "a") : nullptr;
+  }();
+  return file;
+}
 /// Layer groups one pass may be split into (48 visits; the host caps it by pass
 /// length).
 constexpr std::size_t kMaxLayerGroups = 16;
@@ -1347,6 +1358,25 @@ public:
         plain += 0.1 * (cycle - plain);
       else if (!copied && copy_width == 0)
         st.backoff.Observe(static_cast<int>(keep), cycle, plain);
+      if (std::FILE* const trace = LabDsparkTrace()) {
+        const auto ms = [](auto d) {
+          return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::fprintf(trace,
+                     "%.3f pos=%zu greedy=%d sampled=%d n=%d width=%d copy=%d "
+                     "rows=%zu keep=%zu draft_ms=%.3f verify_ms=%.3f "
+                     "post_ms=%.3f plain=%.2f skip=%d v=",
+                     ms(t3.time_since_epoch()), pos, greedy ? 1 : 0,
+                     sampled ? 1 : 0, n, width, copy_width, rows.size(), keep,
+                     ms(t1 - t0), ms(t2 - t1), ms(t3 - t2), plain,
+                     st.backoff.skip);
+        for (int r = 1; r <= DsparkCosts::kMaxRows; ++r)
+          std::fprintf(trace, "%.2f%c", costs_.Verify(r),
+                       r < DsparkCosts::kMaxRows ? ',' : ' ');
+        std::fprintf(trace, "dbase=%.3f dstep=%.3f\n",
+                     costs_.Draft(0),
+                     costs_.Draft(1) - costs_.Draft(0));
+      }
     }
     if (width > 0) {
       step.draft_rounds = 1;
