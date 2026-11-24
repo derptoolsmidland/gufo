@@ -44,6 +44,7 @@
 
 #include "src/models/inkling2/cache_adapter.hpp"
 #include "src/models/inkling2/dspark_policy.hpp"
+#include "src/models/inkling2/dspark_ratio.hpp"
 #include "src/models/inkling2/engine.hpp"
 #include "src/models/inkling2/image_cache.hpp"
 #include "src/models/inkling2/text/gguf_meta.hpp"
@@ -295,6 +296,16 @@ public:
         vision_identity_(std::move(vision_identity)),
         max_draft_(static_cast<std::size_t>(
             std::clamp(max_draft, 0, Drafter::kMaxDraft))) {
+    // Lab diagnostic, never offered upstream (dspark_ratio.hpp).
+    // INKLING2_DSPARK_SAMPLED=ratio: a lone request that samples with
+    // temperature only keeps its drafter proposals by probability.
+    // INKLING2_DSPARK_DIAG=<file>: one line per checked proposal of such
+    // requests (either rule), with the overlap of drafter and target.
+    if (const char* e = std::getenv("INKLING2_DSPARK_SAMPLED"))
+      ratio_ = std::string_view(e) == "ratio";
+    if (const char* e = std::getenv("INKLING2_DSPARK_DIAG");
+        e != nullptr && *e != 0)
+      diag_ = std::fopen(e, "a");
     namespace d = ::inkling2::text::dialect;
     const auto id = [&](std::string_view spelling) {
       const auto t = tok_->FindSpecial(spelling);
@@ -955,10 +966,23 @@ public:
   /// each with the uniform the request's sampler will use for that row.
   struct RowMode {
     bool greedy = false, coupled = false;
+    bool ratio = false;  // lab diagnostic: proposals kept by probability
     Drafter::Coupled cp;
   };
+  /// Lab diagnostic: proposal i's own draw, a hash of the request's RNG
+  /// state at the start of the cycle (24 bits, so it is below 1 as a float).
+  [[nodiscard]] static float DraftUniform(std::uint64_t state, int i) {
+    std::uint64_t z = (state ^ UINT64_C(0x6a09e667f3bcc909)) +
+                      UINT64_C(0xd1b54a32d192ed03) *
+                          static_cast<std::uint64_t>(i + 1);
+    z = (z ^ (z >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    z ^= z >> 31U;
+    return static_cast<float>(z >> 40U) * 0x1.0p-24F;
+  }
   [[nodiscard]] RowMode ModeOf(const Inkling2State& st,
-                               const sampling::SamplerState& working) const {
+                               const sampling::SamplerState& working,
+                               bool lone = false) const {
     RowMode m;
     const auto& cfg = working.config();
     m.greedy = cfg.can_use_unmodified_argmax() && !cfg.logprobs &&
@@ -969,9 +993,26 @@ public:
     if (m.coupled) {
       m.cp.temperature = cfg.temperature;
       m.cp.min_p = cfg.min_p;
-      auto peek = working;  // the draws the rows' selections will make
-      for (float& u : m.cp.u)
-        u = static_cast<float>(peek.Uniform());
+      // Lab diagnostic: a lone request whose rows are plain temperature
+      // draws (Resolve's `parallel` case) keeps the proposals' logits, and
+      // with the probability rule draws its proposals independently of the
+      // sampler and reports confidences that do not depend on the draw.
+      const bool pure = lone && (ratio_ || diag_ != nullptr) &&
+                        cfg.temperature >= 0.1F && !cfg.reasoning_budget &&
+                        !cfg.penalties_enabled() && cfg.min_p == 0 &&
+                        !st.budget_closed && !st.call_required;
+      m.cp.keep_logits = pure;
+      m.ratio = pure && ratio_;
+      m.cp.top_confidence = m.ratio;
+      if (m.ratio) {
+        const std::uint64_t seed = working.rng_state();
+        for (int i = 0; i < Drafter::kMaxDraft; ++i)
+          m.cp.u[i] = DraftUniform(seed, i);
+      } else {
+        auto peek = working;  // the draws the rows' selections will make
+        for (float& u : m.cp.u)
+          u = static_cast<float>(peek.Uniform());
+      }
     }
     return m;
   }
@@ -1173,6 +1214,134 @@ public:
     return keep;
   }
 
+  /// Lab diagnostic: one line per checked proposal. Columns: rule, position,
+  /// proposal index, temperature, the drafter's probability of the proposal
+  /// (device), the target's probability of it, kept (0/1), overlap of the
+  /// two distributions (sum of min), whether the host's walk over the
+  /// read-back logits picks the same token as the device did, and the
+  /// drafter's probability recomputed on the host.
+  void Diag(const char* rule, std::size_t pos, int j, float t, double qx,
+            double px, bool kept, double overlap, bool pick_ok,
+            double q_host) const {
+    const std::lock_guard lock(diag_mutex_);
+    std::fprintf(diag_, "%s\t%zu\t%d\t%.3f\t%.9g\t%.9g\t%d\t%.9g\t%d\t%.9g\n",
+                 rule, pos, j, static_cast<double>(t), qx, px, kept ? 1 : 0,
+                 overlap, pick_ok ? 1 : 0, q_host);
+    std::fflush(diag_);
+  }
+
+  /// Lab diagnostic (dspark_ratio.hpp): Resolve for a lone request that
+  /// samples with temperature only, its proposals drawn from the drafter's
+  /// distribution with draws of their own. Row j's proposal is kept with
+  /// probability min(1, p / q); the first one that is not is replaced by a
+  /// draw from the residual, which becomes the next anchor. After the last
+  /// kept proposal the next anchor is a plain draw from its row. Every
+  /// emitted token has the target's distribution, but it is not the token
+  /// plain decoding draws with the same seed.
+  std::size_t ResolveRatio(Inkling2State& st, sampling::SamplerState& working,
+                           g::TextDecodeStep& step, std::size_t& budget,
+                           std::size_t pos, int width,
+                           const std::int32_t* drafts,
+                           std::span<const float> out, const float* qx,
+                           const Drafter::Coupled& cp) const {
+    const auto& cfg = working.config();
+    const std::size_t V = engine_->config().n_vocab_text;
+    const float cap = engine_->config().logit_softcap;
+    const auto ids = engine_->ProposalHead();
+    thread_local std::vector<double> pw, qw;
+    thread_local std::vector<float> ql;
+    pw.resize(V);
+    std::size_t keep = 1;
+    for (int j = 0; j <= width; ++j) {
+      const auto row = out.subspan(static_cast<std::size_t>(j) * V, V);
+      g::TextRunnerToken tk{};
+      bool accepted = false;
+      if (j < width) {
+        const double total =
+            sampling::LinearRowWeights(row, cfg.temperature, pw);
+        const auto x = static_cast<std::size_t>(drafts[j]);
+        const double px = x < V ? pw[x] / total : 0.0;
+        const double q = static_cast<double>(qx[j]);
+        accepted = q > 0 && ratio::Accept(px, q, working.Uniform());
+        double mass = -1, qtotal = 0;
+        if (!accepted || diag_ != nullptr) {
+          ql.resize(ids.size());
+          engine_->ProposalLogits(j, ql.data());
+          qtotal = ratio::HeadWeights(ql, cap, cfg.temperature, &qw);
+        }
+        if (accepted) {
+          tk = static_cast<g::TextRunnerToken>(drafts[j]);
+        } else {
+          const auto r = ratio::SampleResidual(pw, total, qw, qtotal, ids,
+                                               working.Uniform());
+          tk = static_cast<g::TextRunnerToken>(r.token);
+          mass = r.mass;
+        }
+        if (diag_ != nullptr) {
+          if (mass < 0)
+            mass = ratio::SampleResidual(pw, total, qw, qtotal, ids, 0.0).mass;
+          const std::size_t k =
+              ratio::HeadPick(qw, qtotal, static_cast<double>(cp.u[j]));
+          Diag("ratio", pos, j, cfg.temperature, q, px, accepted, 1.0 - mass,
+               ids[k] == drafts[j], qw[k] / qtotal);
+        }
+      } else {
+        tk = static_cast<g::TextRunnerToken>(working.Sample(row));
+      }
+      const bool stop = st.stop_at_eos() && tok_->IsStop(tk);
+      g::TextDecodeSelection sel{
+          .stop = stop,
+          .token = tk,
+          .piece = stop ? std::string{} : Piece(st, tk),
+          .logprobs = sampling::CollectLogprobs(row, tk, cfg.logprobs)};
+      if (sel.stop) {
+        step.stop = true;
+        step.terminal_logprobs = std::move(sel.logprobs);
+        break;
+      }
+      if (j < width && budget > 0 && accepted) {
+        working.Accept(sel.token);
+        CommitToken(st, sel.token);
+        step.selections.push_back(std::move(sel));
+        --budget;
+        ++keep;
+        continue;
+      }
+      st.pending = std::move(sel);
+      break;
+    }
+    return keep;
+  }
+
+  /// Lab diagnostic: after a cycle under today's rule, the overlap of drafter
+  /// and target for every proposal whose prefix was kept (proposal j was
+  /// itself kept when j < kept).
+  void LogCoupled(std::size_t pos, int width, int kept,
+                  const std::int32_t* drafts, std::span<const float> out,
+                  const float* qx, const Drafter::Coupled& cp) const {
+    const std::size_t V = engine_->config().n_vocab_text;
+    const float cap = engine_->config().logit_softcap;
+    const auto ids = engine_->ProposalHead();
+    thread_local std::vector<double> pw, qw;
+    thread_local std::vector<float> ql;
+    pw.resize(V);
+    ql.resize(ids.size());
+    for (int j = 0; j < width && j <= kept; ++j) {
+      const auto row = out.subspan(static_cast<std::size_t>(j) * V, V);
+      const double total = sampling::LinearRowWeights(row, cp.temperature, pw);
+      const auto x = static_cast<std::size_t>(drafts[j]);
+      const double px = x < V ? pw[x] / total : 0.0;
+      engine_->ProposalLogits(j, ql.data());
+      const double qtotal = ratio::HeadWeights(ql, cap, cp.temperature, &qw);
+      const double mass =
+          ratio::SampleResidual(pw, total, qw, qtotal, ids, 0.0).mass;
+      const std::size_t k =
+          ratio::HeadPick(qw, qtotal, static_cast<double>(cp.u[j]));
+      Diag("coupled", pos, j, cp.temperature, static_cast<double>(qx[j]), px,
+           j < kept, 1.0 - mass, ids[k] == drafts[j], qw[k] / qtotal);
+    }
+  }
+
   /// DSpark cycle: the anchor (the pending token, or a selection from the
   /// session's logits) is emitted, the drafter proposes up to seven tokens
   /// after it, and one Engine::Verify step evaluates the anchor and the first
@@ -1205,8 +1374,9 @@ public:
     const auto t0 = Clock::now();
     std::int32_t drafts[Engine::kMaxVerifyRows] = {};
     float conf[Engine::kMaxVerifyRows] = {};
+    float qx[Engine::kMaxVerifyRows] = {};  // lab diagnostic
     int n = 0;
-    const RowMode mode = ModeOf(st, working);
+    const RowMode mode = ModeOf(st, working, true);
     const bool greedy = mode.greedy;
     const bool sampled = working.config().temperature > 0;
     const std::size_t rows_room = engine_->VerifyRows(ss) - 1;
@@ -1254,6 +1424,7 @@ public:
     }
     const bool copied = copy_width > 0;
     DsparkCalibration& cal = copy_only && sampled ? cal_copy_sampled_
+                             : mode.ratio         ? cal_ratio_
                              : mode.coupled       ? cal_coupled_
                                                   : cal_;
     if (!copied && budget > 0 && engine_->DraftReady(ss) &&
@@ -1267,7 +1438,8 @@ public:
               const std::lock_guard lock(dsp_mutex_);
               return ChooseDsparkWidth(p, i, cal, costs_) == i;
             },
-            mode.coupled ? &mode.cp : nullptr);
+            mode.coupled ? &mode.cp : nullptr,
+            mode.cp.keep_logits ? qx : nullptr);
     }
     const auto t1 = Clock::now();
     int width = 0;
@@ -1279,6 +1451,20 @@ public:
       width = copied  ? copy_width
               : n > 0 ? ChooseDsparkWidth(conf, n, cal, costs_)
                       : 0;
+      if (!copied && mode.ratio) {
+        // Lab diagnostic (the probability rule): whether proposal i is
+        // checked may depend only on the proposals before it. The choice
+        // over all n looks at later proposals' confidences, which depend on
+        // proposal i; so take the longest prefix every proposal of which the
+        // policy would check given the ones before (the test Propose's
+        // `more` applies while drafting).
+        width = 0;
+        for (int i = 1; i <= n; ++i) {
+          if (ChooseDsparkWidth(conf, i, cal, costs_) != i)
+            break;
+          width = i;
+        }
+      }
     }
     if (!copied && lookup_ready && greedy) {
       // the drafter's proposals, then the copy their context continues
@@ -1324,8 +1510,20 @@ public:
                       greedy ? amax : nullptr);
     }
     const auto t2 = Clock::now();
-    const std::size_t keep = Resolve(st, working, step, budget, pos, width,
-                                     drafts, out, amax, greedy);
+    // Lab diagnostic: a lone sampled request's drafter proposals are kept
+    // by probability, or by today's rule with the overlap logged.
+    const bool logits_kept =
+        mode.cp.keep_logits && !copied && width > 0 &&
+        pos + static_cast<std::size_t>(width) + 1 < max_context_;
+    const bool by_ratio = mode.ratio && logits_kept;
+    const std::size_t keep =
+        by_ratio ? ResolveRatio(st, working, step, budget, pos, width, drafts,
+                                out, qx, mode.cp)
+                 : Resolve(st, working, step, budget, pos, width, drafts, out,
+                           amax, greedy);
+    if (diag_ != nullptr && logits_kept && !by_ratio)
+      LogCoupled(pos, width, static_cast<int>(keep) - 1, drafts, out, qx,
+                 mode.cp);
     if (width > 0)
       engine_->CommitVerify(ss, keep, out);  // empty: from the device
     sampler.CopyDrawStateFrom(working);
@@ -1829,6 +2027,12 @@ private:
   // DSpark width policy, shared by the requests
   mutable std::mutex dsp_mutex_;
   mutable DsparkCalibration cal_, cal_coupled_;
+  // Lab diagnostic (dspark_ratio.hpp): the probability rule's switch, its
+  // calibration, and the log of checked proposals.
+  bool ratio_ = false;
+  mutable DsparkCalibration cal_ratio_;
+  std::FILE* diag_ = nullptr;
+  mutable std::mutex diag_mutex_;
   // copied proposals (prompt lookup) of greedy and of sampled requests
   mutable DsparkCalibration cal_copy_, cal_copy_sampled_;
   mutable double plain_greedy_ms_ = 20.2, plain_sampled_ms_ = 20.8;

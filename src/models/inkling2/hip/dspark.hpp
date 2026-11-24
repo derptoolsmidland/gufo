@@ -129,10 +129,13 @@ void Gemv8N(hipStream_t s, int n, const void* const* w, const int* m, int k,
 /// min-p floor dropped; the token where the running sum first passes u
 /// (the target sampler's linear draw with the uniform it will use), mapped
 /// through `map`, goes to tokens[row] and *prev, its p to conf[row].
-/// ws: 3 * 128 + 1 floats.
+/// ws: 3 * 128 + 1 floats. Lab diagnostic (the probability rule): with `qx`
+/// the token's p also goes to qx[row]; with `top`, conf[row] is the
+/// distribution's top probability, which does not depend on the draw.
 void CoupledSample(hipStream_t s, const float* logits, int n, const int* map,
                    float softcap, float temperature, float min_p, float u,
-                   float* ws, int* tokens, int row, int* prev, float* conf);
+                   float* ws, int* tokens, int row, int* prev, float* conf,
+                   float* qx = nullptr, bool top = false);
 
 /// dst[i] = F16(src[i]), i < n.
 void ToHalf(hipStream_t s, const float* src, std::size_t n, _Float16* dst);

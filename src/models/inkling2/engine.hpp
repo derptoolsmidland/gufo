@@ -278,7 +278,11 @@ public:
   [[nodiscard]] bool DraftReady(const Session& s) const;
   int Propose(Session& s, std::int32_t anchor, int n, std::int32_t* out,
               float* confidence = nullptr, const Drafter::More& more = {},
-              const Drafter::Coupled* coupled = nullptr);
+              const Drafter::Coupled* coupled = nullptr, float* qx = nullptr);
+  /// Lab diagnostic (the probability rule): Drafter::ProposalLogits and
+  /// Drafter::head_ids of the attached drafter.
+  void ProposalLogits(int step, float* out);
+  [[nodiscard]] std::span<const int> ProposalHead() const;
 
   /// One decode step of `token` that leaves the logits on the device (the
   /// session copies them when read) and writes their argmax (the greedy

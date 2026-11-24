@@ -93,13 +93,27 @@ public:
   struct Coupled {
     float temperature = 1.f, min_p = 0.f;
     float u[kMaxDraft] = {};
+    /// Lab diagnostic (the probability rule), a lone request only.
+    /// keep_logits: every proposal's head logits stay on the device for
+    /// ProposalLogits. top_confidence: the reported confidences are each
+    /// distribution's top probability instead of the drawn token's, so the
+    /// width decision does not depend on the draw (u are then draws of the
+    /// drafter's own, not the target sampler's).
+    bool keep_logits = false, top_confidence = false;
   };
   /// Up to `n` (<= kMaxDraft) greedy proposals after `anchor` at `pos`, and
   /// optionally each one's draft probability (the softmax maximum over the
   /// proposal head). Returns how many were drafted.
   int Propose(hipStream_t s, State& st, std::int32_t anchor, std::size_t pos,
               int n, std::int32_t* out, float* confidence = nullptr,
-              const More& more = {}, const Coupled* coupled = nullptr);
+              const More& more = {}, const Coupled* coupled = nullptr,
+              float* qx = nullptr);
+  /// Lab diagnostic: the proposal-head logits (head_ids().size() floats, in
+  /// head-row order, before the softcap) of proposal `step` (0-based) of the
+  /// last Propose that ran with Coupled::keep_logits.
+  void ProposalLogits(hipStream_t s, int step, float* out) const;
+  /// The token id of every proposal-head row, ascending.
+  [[nodiscard]] std::span<const int> head_ids() const;
   /// Proposals of several sessions at once (up to kMaxSessions): each
   /// request's drafts are those a lone Propose gives, and every weight row is
   /// read once for all of them.
@@ -114,6 +128,7 @@ public:
     const More* more = nullptr;
     const Coupled* coupled = nullptr;
     int done = 0;  // out: drafts written
+    float* qx = nullptr;  // lab diagnostic: the drawn tokens' probabilities
   };
   void ProposeBatch(hipStream_t s, std::span<Request> requests);
 

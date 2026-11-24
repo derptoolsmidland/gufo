@@ -68,6 +68,12 @@ struct Drafter::Impl {
   // pinned host staging: [anchor, pos] in, [tokens 8 | confidences 8] out
   int* h_in = nullptr;
   float* h_out = nullptr;
+  // Lab diagnostic (the probability rule): every proposal's head logits of a
+  // lone request [kMaxDraft][kHeadRows], the drawn tokens' probabilities,
+  // their pinned staging, and the head's token ids on the host.
+  float *qlog = nullptr, *d_qx = nullptr;
+  float *h_q = nullptr, *h_qx = nullptr;
+  std::vector<int> head_host;
   // work items of n = 1 .. 8 rows (one item each) for injections
   int* small_items = nullptr;
   int *it_n, *it_e, *it_s, *it_c;  // GEMM work items (n rows)
@@ -95,6 +101,10 @@ struct Drafter::Impl {
       (void)hipHostFree(h_in);
     if (h_out)
       (void)hipHostFree(h_out);
+    if (h_q)
+      (void)hipHostFree(h_q);
+    if (h_qx)
+      (void)hipHostFree(h_qx);
   }
 
   const GgufTensorInfo& Need(std::string_view name, GgmlType type,
@@ -268,6 +278,9 @@ std::unique_ptr<Drafter> Drafter::Open(const std::string& path,
     I.joint = I.Alloc<float>(S * 1024);
     I.ws = I.Alloc<float>(S * (3 * 128 + 1));
     I.d_conf = I.Alloc<float>(S * 8);
+    I.d_qx = I.Alloc<float>(S * 8);
+    I.qlog = I.Alloc<float>(static_cast<std::size_t>(kMaxDraft) *
+                            Impl::kHeadRows);
     {
       // the kHeadRows text tokens with the largest markov_w1 rows
       const auto& w1t =
@@ -297,6 +310,7 @@ std::unique_ptr<Drafter> Drafter::Open(const std::string& path,
         ids[static_cast<std::size_t>(i)] =
             norm[static_cast<std::size_t>(i)].second;
       std::sort(ids.begin(), ids.end());
+      I.head_host = ids;
       I.head_ids = I.Alloc<int>(ids.size());
       Check(hipMemcpy(I.head_ids, ids.data(), ids.size() * 4,
                       hipMemcpyHostToDevice),
@@ -371,6 +385,12 @@ std::unique_ptr<Drafter> Drafter::Open(const std::string& path,
           "pinned");
     Check(hipHostMalloc(reinterpret_cast<void**>(&I.h_out),
                         16 * kMaxSessions * sizeof(float)),
+          "pinned");
+    Check(hipHostMalloc(reinterpret_cast<void**>(&I.h_q),
+                        Impl::kHeadRows * sizeof(float)),
+          "pinned");
+    Check(hipHostMalloc(reinterpret_cast<void**>(&I.h_qx),
+                        8 * kMaxSessions * sizeof(float)),
           "pinned");
     I.small_items = I.Alloc<int>(8 * 4);
     {
@@ -572,7 +592,7 @@ void Drafter::InjectRows(hipStream_t s, std::span<const Rows> rows) {
 int Drafter::Propose(hipStream_t s, State& st, std::int32_t anchor,
                      std::size_t pos, int n, std::int32_t* out,
                      float* confidence, const More& more,
-                     const Coupled* coupled) {
+                     const Coupled* coupled, float* qx) {
   Request r{.st = &st,
             .anchor = anchor,
             .pos = pos,
@@ -581,8 +601,25 @@ int Drafter::Propose(hipStream_t s, State& st, std::int32_t anchor,
             .confidence = confidence,
             .more = more ? &more : nullptr,
             .coupled = coupled};
+  r.qx = qx;
   ProposeBatch(s, std::span<Request>(&r, 1));
   return r.done;
+}
+
+void Drafter::ProposalLogits(hipStream_t s, int step, float* out) const {
+  const Impl& I = *impl_;
+  constexpr std::size_t R = Impl::kHeadRows;
+  if (step < 0 || step >= kMaxDraft)
+    throw std::runtime_error("inkling2 dspark: bad proposal step");
+  Check(hipMemcpyAsync(I.h_q, I.qlog + static_cast<std::size_t>(step) * R,
+                       R * 4, hipMemcpyDeviceToHost, s),
+        "proposal logits");
+  Check(hipStreamSynchronize(s), "proposal logits sync");
+  std::memcpy(out, I.h_q, R * 4);
+}
+
+std::span<const int> Drafter::head_ids() const {
+  return impl_->head_host;
 }
 
 void Drafter::ProposeBatch(hipStream_t s, std::span<Request> req) {
@@ -683,7 +720,11 @@ void Drafter::ProposeBatch(hipStream_t s, std::span<Request> req) {
       ma.prev = I.d_prev + g;
       ma.row = i;
       dsp::MarkovStep(s, ma);
-      float* logits = I.logits + static_cast<std::size_t>(g) * R;
+      // (the probability rule keeps every proposal's logits of a lone request)
+      const bool kept =
+          S == 1 && rq.coupled != nullptr && rq.coupled->keep_logits;
+      float* logits = kept ? I.qlog + static_cast<std::size_t>(i - 1) * R
+                           : I.logits + static_cast<std::size_t>(g) * R;
       float* ws = I.ws + g * (3 * 128 + 1);
       dsp::LrLogits8(s, I.pt, I.ps, I.cb,
                      I.base + (static_cast<std::size_t>(g) * B + i) * R,
@@ -692,7 +733,9 @@ void Drafter::ProposeBatch(hipStream_t s, std::span<Request> req) {
         dsp::CoupledSample(
             s, logits, static_cast<int>(R), I.head_ids, I.target.softcap,
             rq.coupled->temperature, rq.coupled->min_p, rq.coupled->u[i - 1],
-            ws, I.d_tokens + g * 8, i - 1, I.d_prev + g, I.d_conf + g * 8);
+            ws, I.d_tokens + g * 8, i - 1, I.d_prev + g, I.d_conf + g * 8,
+            rq.qx != nullptr ? I.d_qx + g * 8 : nullptr,
+            rq.coupled->top_confidence);
       else
         dsp::Argmax(s, logits, static_cast<int>(R), I.head_ids, ws,
                     I.d_tokens + g * 8, i - 1, I.d_prev + g, I.d_conf + g * 8);
@@ -726,6 +769,10 @@ void Drafter::ProposeBatch(hipStream_t s, std::span<Request> req) {
     Check(hipMemcpyAsync(I.h_out + 16 * g + 8, I.d_conf + g * 8, d * 4,
                          hipMemcpyDeviceToHost, s),
           "confidence");
+    if (req[g].qx != nullptr && d > 0)
+      Check(hipMemcpyAsync(I.h_qx + 8 * g, I.d_qx + g * 8, d * 4,
+                           hipMemcpyDeviceToHost, s),
+            "draft probabilities");
   }
   Check(hipStreamSynchronize(s), "propose sync");
   for (int g = 0; g < S; ++g) {
@@ -733,6 +780,8 @@ void Drafter::ProposeBatch(hipStream_t s, std::span<Request> req) {
     std::memcpy(req[g].out, I.h_out + 16 * g, d * 4);
     if (req[g].confidence != nullptr)
       std::memcpy(req[g].confidence, I.h_out + 16 * g + 8, d * 4);
+    if (req[g].qx != nullptr)
+      std::memcpy(req[g].qx, I.h_qx + 8 * g, d * 4);
   }
 }
 

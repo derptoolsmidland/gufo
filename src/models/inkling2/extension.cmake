@@ -85,6 +85,14 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_inkling2
 )
+# Lab diagnostic (host only): the probability rule of dspark_ratio.hpp.
+gufo_extension_target(
+  NAME inkling2_ratio_test
+  SOURCES
+    tests/spec/ratio_test.cpp
+  LINK_LIBRARIES
+    gufo_inkling2
+)
 if(TARGET inkling2_text_test)
   target_compile_definitions(inkling2_text_test PRIVATE
     INKLING2_TEXT_GOLDENS_DIR="${GUFO_EXTENSION_BUILD_ROOT}/tests/text/goldens")

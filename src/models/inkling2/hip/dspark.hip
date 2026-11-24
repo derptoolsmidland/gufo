@@ -585,7 +585,7 @@ __global__ void __launch_bounds__(256)
 __global__ void __launch_bounds__(256)
     k_cs_pick(const float* x, int n, const int* map, float cap, float t,
               float min_p, float u, const float* ws, int* tokens, int row,
-              int* prev, float* conf) {
+              int* prev, float* conf, float* qx, int top) {
   __shared__ int chunk;
   __shared__ float before, total;
   __shared__ float part[256];
@@ -643,7 +643,13 @@ __global__ void __launch_bounds__(256)
     const int id = map ? map[tok] : tok;
     tokens[row] = id;
     *prev = id;
-    conf[row] = cs_weight(x[tok], cap, m, t, floor_) / total;
+    const float q = cs_weight(x[tok], cap, m, t, floor_) / total;
+    // Lab diagnostic (the probability rule): the width policy must not see
+    // the drawn token there, so conf is the distribution's top probability
+    // (the maximum's weight is 1); the drawn token's probability goes to qx.
+    conf[row] = top ? 1.f / total : q;
+    if (qx != nullptr)
+      qx[row] = q;
   }
 }
 
@@ -832,12 +838,13 @@ void Gemv8(hipStream_t s, const void* w, int m, int k, const _Float16* x,
 }
 void CoupledSample(hipStream_t s, const float* logits, int n, const int* map,
                    float softcap, float temperature, float min_p, float u,
-                   float* ws, int* tokens, int row, int* prev, float* conf) {
+                   float* ws, int* tokens, int row, int* prev, float* conf,
+                   float* qx, bool top) {
   k_cs_max<<<kCsBlocks, 256, 0, s>>>(logits, n, softcap, ws);
   k_cs_sum<<<kCsBlocks, 256, 0, s>>>(logits, n, softcap, temperature, min_p,
                                      ws);
   k_cs_pick<<<1, 256, 0, s>>>(logits, n, map, softcap, temperature, min_p, u,
-                              ws, tokens, row, prev, conf);
+                              ws, tokens, row, prev, conf, qx, top ? 1 : 0);
   Chk("coupled sample");
 }
 __global__ void __launch_bounds__(256)

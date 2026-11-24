@@ -1571,6 +1571,39 @@ double Uniform(std::uint64_t* state) {
   return static_cast<double>(value >> 11U) * 0x1.0p-53;
 }
 
+double LinearRowWeights(std::span<const float> logits, float temperature,
+                        std::span<double> weight) {
+  const std::size_t size = logits.size();
+  if (weight.size() != size)
+    throw std::invalid_argument("weight buffer does not match the row");
+  float best = -std::numeric_limits<float>::infinity();
+  std::size_t finite = 0;
+  for (std::size_t i = 0; i < size; ++i) {
+    const float logit = logits[i];
+    if (std::abs(logit) <= std::numeric_limits<float>::max()) {
+      best = logit > best ? logit : best;
+      ++finite;
+    }
+  }
+  if (finite == 0)
+    throw std::runtime_error("logit distribution contains no finite values");
+  const double maximum = static_cast<double>(best);
+  double* const out = weight.data();
+  RowWorkers::Get().Run(size, [&](std::size_t first, std::size_t end) {
+    for (std::size_t i = first; i < end; ++i)
+      out[i] = std::abs(logits[i]) <= std::numeric_limits<float>::max()
+                   ? std::exp((static_cast<double>(logits[i]) - maximum) /
+                              temperature)
+                   : 0;
+  });
+  double total = 0;
+  for (std::size_t i = 0; i < size; ++i)
+    total += out[i];
+  if (!(total > 0) || !std::isfinite(total))
+    throw std::runtime_error("logit softmax normalization failed");
+  return total;
+}
+
 TokenId SampleLogits(std::span<const float> logits, float temperature,
                      std::uint64_t* rng_state) {
   if (temperature > 0.0F && rng_state == nullptr) {

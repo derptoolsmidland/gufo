@@ -272,6 +272,15 @@ private:
 [[nodiscard]] std::uint64_t NextRandom(std::uint64_t* state);
 [[nodiscard]] double Uniform(std::uint64_t* state);
 
+/// Lab diagnostic (speculative acceptance by probability): the weights of
+/// SamplerState::Sample's whole-row temperature draw without penalties or
+/// min-p, weight[i] = exp((logits[i] - max) / temperature) and 0 for a
+/// non-finite entry, from the same operands as the draw. Returns their sum,
+/// taken in token order. `weight` has logits.size() entries.
+[[nodiscard]] double LinearRowWeights(std::span<const float> logits,
+                                      float temperature,
+                                      std::span<double> weight);
+
 // Compatibility helpers for callers that have not yet adopted SamplerState.
 [[nodiscard]] TokenId SampleLogits(std::span<const float> logits,
                                    float temperature, std::uint64_t* rng_state);
