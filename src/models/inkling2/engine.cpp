@@ -2287,8 +2287,7 @@ void Engine::CalibrateDecodePrefetch() {
     I.decode_prefetch = false;
     I.LabDump();
     std::fprintf(stderr, "inkling2: decode weight prefetch off (lab "
-                         "diagnostic switch, not calibrated)
-");
+                         "diagnostic switch, not calibrated)\n");
     return;
   }
   // Replayed one-session decode steps of a scratch session, as in serving:
