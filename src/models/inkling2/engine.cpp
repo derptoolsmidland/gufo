@@ -361,6 +361,11 @@ struct Engine::Impl {
   // (how the attention weight of each head is spread over the context).
   std::FILE* lab_attn_dump = nullptr;
   int lab_pos = 0;
+  void LabDump() {
+    if (const char* e = std::getenv("INKLING2_LAB_ATTN_DUMP");
+        e != nullptr && *e != 0 && lab_attn_dump == nullptr)
+      lab_attn_dump = std::fopen(e, "ab");
+  }
   float* d_blk[16];
   int nblk_alloc = 0;
   int* d_ids8;
@@ -2275,6 +2280,17 @@ std::unique_ptr<Engine> Engine::Create(
 
 void Engine::CalibrateDecodePrefetch() {
   Impl& I = *impl_;
+  // Lab diagnostic (see Impl::lab_attn_dump): no prefetch and no calibration
+  // steps, so a profiler never sees the prefetch side stream.
+  if (const char* e = std::getenv("INKLING2_LAB_NO_DECODE_PREFETCH");
+      e != nullptr && *e == '1') {
+    I.decode_prefetch = false;
+    I.LabDump();
+    std::fprintf(stderr, "inkling2: decode weight prefetch off (lab "
+                         "diagnostic switch, not calibrated)
+");
+    return;
+  }
   // Replayed one-session decode steps of a scratch session, as in serving:
   // the prefetch's cost is its cross-stream waits inside the graph. Alternate
   // the layouts and keep each one's fastest step; the first round captures
@@ -2299,12 +2315,7 @@ void Engine::CalibrateDecodePrefetch() {
   }
   // A tie keeps the plain layout.
   I.decode_prefetch = best[1] < best[0];
-  if (const char* e = std::getenv("INKLING2_LAB_NO_DECODE_PREFETCH");
-      e != nullptr && *e == '1')
-    I.decode_prefetch = false;  // lab diagnostic, see Impl::lab_attn_dump
-  if (const char* e = std::getenv("INKLING2_LAB_ATTN_DUMP");
-      e != nullptr && *e != 0)
-    I.lab_attn_dump = std::fopen(e, "ab");
+  I.LabDump();  // lab diagnostic, after the calibration's own steps
   I.DropGraphs();
   std::fprintf(stderr,
                "inkling2: decode weight prefetch %s (step %.2f ms with it, "
