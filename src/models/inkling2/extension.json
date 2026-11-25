@@ -121,6 +121,12 @@
       ],
       "role": "test"
     },
+    "inkling2_ratio_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "inkling2_oracle": {
       "requires": [
         "hip",
