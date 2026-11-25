@@ -351,6 +351,16 @@ struct Engine::Impl {
   static constexpr int kSProj = 8576;      // d_proj
   static constexpr std::size_t kMaxSplit = 256;
   int nb = 1;  // tokens of the decode step being built
+  // Lab diagnostic, never offered upstream (both off unless the variable is
+  // set, and then the logits are unchanged):
+  // INKLING2_LAB_NO_DECODE_PREFETCH=1 keeps the decode weight prefetch off,
+  // because rocprofv3 hangs on its side stream.
+  // INKLING2_LAB_ATTN_DUMP=<file> runs one-session decode steps without a
+  // captured graph and appends, after every global-attention visit, the
+  // per-split softmax maximum and sum the kernel leaves in its workspace
+  // (how the attention weight of each head is spread over the context).
+  std::FILE* lab_attn_dump = nullptr;
+  int lab_pos = 0;
   float* d_blk[16];
   int nblk_alloc = 0;
   int* d_ids8;
@@ -1511,6 +1521,20 @@ struct Engine::Impl {
       aa.ws_tok = static_cast<int>(kMaxSplit * 8 * 12);
       if (!verify_mode) {
         fs::KvAttnDecode(ds, ka, aa, nb);
+        if (lab_attn_dump != nullptr && !swa && nb == 1) {
+          Check(hipStreamSynchronize(ds), "lab attention dump");
+          const std::size_t n = static_cast<std::size_t>(aa.nsplit) * 8 * 12;
+          std::vector<float> m(n), l(n);
+          Check(hipMemcpy(m.data(), d_ws_m, n * 4, hipMemcpyDeviceToHost),
+                "lab attention dump");
+          Check(hipMemcpy(l.data(), d_ws_l, n * 4, hipMemcpyDeviceToHost),
+                "lab attention dump");
+          const std::int32_t head[6] = {0x4e545441, ip, slot_idx, lab_pos,
+                                        aa.nsplit, aa.chunk};
+          std::fwrite(head, sizeof head, 1, lab_attn_dump);
+          std::fwrite(m.data(), 4, n, lab_attn_dump);
+          std::fwrite(l.data(), 4, n, lab_attn_dump);
+        }
       } else {
         for (int c0 = 0; c0 < nb; c0 += kChunk) {
           const int cn = std::min(kChunk, nb - c0);
@@ -1842,9 +1866,14 @@ struct Engine::Impl {
                            ds),
             "slot table");
     const int key = ctx * 128 + n + (decode_prefetch ? (1 << 29) : 0);
-    auto it = graphs.find(key);
-    if (it == graphs.end() && failed_graphs.count(key) == 0)
-      it = CaptureGraph(ctx, key);
+    auto it = graphs.end();
+    const bool lab_eager = lab_attn_dump != nullptr && n == 1;
+    lab_pos = maxpos;
+    if (!lab_eager) {
+      it = graphs.find(key);
+      if (it == graphs.end() && failed_graphs.count(key) == 0)
+        it = CaptureGraph(ctx, key);
+    }
     if (it != graphs.end()) {
       Check(hipGraphLaunch(it->second, ds), "graph launch");
     } else {
@@ -2270,6 +2299,12 @@ void Engine::CalibrateDecodePrefetch() {
   }
   // A tie keeps the plain layout.
   I.decode_prefetch = best[1] < best[0];
+  if (const char* e = std::getenv("INKLING2_LAB_NO_DECODE_PREFETCH");
+      e != nullptr && *e == '1')
+    I.decode_prefetch = false;  // lab diagnostic, see Impl::lab_attn_dump
+  if (const char* e = std::getenv("INKLING2_LAB_ATTN_DUMP");
+      e != nullptr && *e != 0)
+    I.lab_attn_dump = std::fopen(e, "ab");
   I.DropGraphs();
   std::fprintf(stderr,
                "inkling2: decode weight prefetch %s (step %.2f ms with it, "
